@@ -16,8 +16,9 @@ usage: epochup              open the popup on the clipboard's contents
        epochup TEXT...      open the popup with TEXT typed in
        epochup -e TEXT...   print the conversion of TEXT (stdin with -) and exit
 
-In the popup: Enter copies the highlighted value and closes, Tab and Shift+Tab
-move the highlight, Alt+1..9 copy an alternative, Esc closes.";
+In the popup: Enter copies the highlighted value and closes, arrows and Tab
+move the highlight, Alt+1..9 copy an alternative. Esc first sets the clipboard
+aside to show the current time, then closes.";
 
 fn main() -> eframe::Result {
     locale::init();
@@ -50,26 +51,26 @@ fn main() -> eframe::Result {
         rx
     });
 
-    let chosen = Rc::new(RefCell::new(None));
+    let copied = Rc::new(RefCell::new(None));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("epochup")
             .with_title("epochup")
-            .with_inner_size([780.0, 220.0])
+            .with_inner_size([900.0, 230.0])
             .with_decorations(false),
         ..Default::default()
     };
-    let app_chosen = chosen.clone();
+    let app_copied = copied.clone();
     eframe::run_native(
         "epochup",
         options,
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx, font.join().ok().flatten());
-            Ok(Box::new(app::App::new(cc, input, clip_rx, app_chosen)))
+            Ok(Box::new(app::App::new(cc, input, clip_rx, app_copied)))
         }),
     )?;
 
-    if let Some(text) = chosen.take()
+    if let Some(text) = copied.take()
         && let Err(e) = clipboard::hand_off(&text)
     {
         eprintln!("epochup: copying to the clipboard: {e}");

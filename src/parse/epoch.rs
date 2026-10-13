@@ -53,6 +53,10 @@ impl Unit {
     }
 }
 
+/// Smaller numbers (before 1970-04-26) are far more likely to be counts,
+/// years or days of the month than instants.
+const MIN_EPOCH: i64 = 10_000_000;
+
 #[derive(Clone, Debug)]
 pub struct Epoch {
     pub ts: Timestamp,
@@ -237,6 +241,9 @@ fn decode(lit: &Lit) -> Option<Epoch> {
         ns = -ns;
     }
     let ts = Timestamp::from_nanosecond(ns).ok()?;
+    if ts.as_second() < MIN_EPOCH {
+        return None;
+    }
     Some(Epoch {
         ts,
         unit,
@@ -257,20 +264,11 @@ pub fn is_compact_date(s: &str) -> bool {
     (s.len() < 12 || (n(8..10) < 24 && n(10..12) < 60)) && (s.len() < 14 || n(12..14) < 60)
 }
 
-/// A plain number that reads better as a date: a day of the month (`14`),
-/// an org-mode day offset (`+4`, `-1`) or a compact date (`20261013`).
+/// A plain number that reads better as a date: `20261013`.
 fn prefers_date(lit: &Lit) -> bool {
-    if lit.at || lit.suffix.is_some() || !lit.frac.is_empty() || lit.exp != 0 {
-        return false;
-    }
-    let n = lit.int.len();
-    if lit.signed {
-        return n <= 3;
-    }
-    if n <= 2 {
-        return lit.int.parse::<u32>().is_ok_and(|v| (1..=31).contains(&v));
-    }
-    is_compact_date(&lit.int)
+    let plain =
+        !lit.at && !lit.signed && lit.suffix.is_none() && lit.frac.is_empty() && lit.exp == 0;
+    plain && is_compact_date(&lit.int)
 }
 
 pub struct Dominant {
@@ -360,21 +358,23 @@ mod tests {
             dom("@1760383456"),
             Some((1760383456 * S, Unit::Seconds, false))
         );
-        assert_eq!(dom("-86400"), Some((-86400 * S, Unit::Seconds, false)));
         assert_eq!(
             dom("1_760_383_456"),
             Some((1760383456 * S, Unit::Seconds, false))
         );
-        assert_eq!(dom("0"), Some((0, Unit::Seconds, false)));
     }
 
     #[test]
     fn suffixes() {
         assert_eq!(
-            dom("1760383456 ms"),
-            Some((1760383456 * 1_000_000, Unit::Millis, false))
+            dom("1760383456123 ms"),
+            Some((1760383456123 * 1_000_000, Unit::Millis, false))
         );
-        assert_eq!(dom("90s"), Some((90 * S, Unit::Seconds, false)));
+        assert_eq!(
+            dom("1760383456 s"),
+            Some((1760383456 * S, Unit::Seconds, false))
+        );
+        assert!(dom("90s").is_none(), "too small to be an instant");
         assert!(dom("9pm").is_none());
         assert!(dom("+3d").is_none());
     }
@@ -397,12 +397,19 @@ mod tests {
 
     #[test]
     fn date_readings_win() {
-        assert_eq!(dom("14").map(|d| d.2), Some(true));
-        assert_eq!(dom("45").map(|d| d.2), Some(false));
-        assert_eq!(dom("+4").map(|d| d.2), Some(true));
         assert_eq!(dom("20261013").map(|d| d.2), Some(true));
         assert_eq!(dom("20261313").map(|d| d.2), Some(false));
         assert_eq!(dom("20261013212416").map(|d| d.2), Some(true));
+    }
+
+    #[test]
+    fn small_numbers_are_not_epochs() {
+        for input in [
+            "0", "14", "45", "+4", "-86400", "2026", "9999999", "@45", "5000 ms",
+        ] {
+            assert!(dom(input).is_none(), "{input}");
+        }
+        assert!(dom("10000000").is_some());
     }
 
     #[test]

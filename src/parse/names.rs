@@ -96,13 +96,14 @@ pub fn unit(w: &str, org: bool) -> Option<Unit> {
     Some(match w {
         "m" if org => Month,
         "m" => Minute,
-        "s" | "sec" | "secs" | "second" | "seconds" | "sek" | "sekunde" | "sekunden" | "秒" => {
-            Second
-        }
-        "min" | "mins" | "minute" | "minutes" | "minuten" | "分" => Minute,
-        "h" | "hr" | "hrs" | "hour" | "hours" | "std" | "stunde" | "stunden" | "時間" => Hour,
-        "d" | "day" | "days" | "tag" | "tage" | "tagen" | "日" => Day,
-        "w" | "wk" | "wks" | "week" | "weeks" | "woche" | "wochen" | "週" | "週間" => Week,
+        "s" | "sec" | "secs" | "second" | "seconds" | "sek" | "sekunde" | "sekunden" | "秒"
+        | "秒钟" | "秒鐘" => Second,
+        "min" | "mins" | "minute" | "minutes" | "minuten" | "分" | "分钟" | "分鐘" => Minute,
+        "h" | "hr" | "hrs" | "hour" | "hours" | "std" | "stunde" | "stunden" | "時間" | "小时"
+        | "小時" | "钟头" | "鐘頭" => Hour,
+        "d" | "day" | "days" | "tag" | "tage" | "tagen" | "日" | "天" => Day,
+        "w" | "wk" | "wks" | "week" | "weeks" | "woche" | "wochen" | "週" | "週間" | "周"
+        | "星期" | "礼拜" | "禮拜" => Week,
         "mo" | "mos" | "month" | "months" | "monat" | "monate" | "monaten" | "ヶ月" | "か月"
         | "カ月" | "ケ月" | "箇月" => Month,
         "y" | "yr" | "yrs" | "year" | "years" | "jahr" | "jahre" | "jahren" | "年" => Year,
@@ -121,13 +122,19 @@ pub enum Keyword {
 pub fn keyword(w: &str) -> Option<(Keyword, bool)> {
     use Keyword::*;
     Some(match w {
-        "now" | "jetzt" | "今" => (Now, false),
-        "today" | "tdy" | "heute" | "今日" | "本日" | "きょう" => (Day(0), true),
-        "tomorrow" | "tmrw" | "tmr" | "明日" | "あした" | "あす" => (Day(1), true),
+        "now" | "jetzt" | "今" | "现在" | "現在" => (Now, false),
+        "today" | "tdy" | "heute" | "今日" | "本日" | "きょう" | "今天" => (Day(0), true),
+        "tomorrow" | "tmrw" | "tmr" | "明日" | "あした" | "あす" | "明天" => {
+            (Day(1), true)
+        }
         "morgen" => (Day(1), false),
-        "yesterday" | "yday" | "gestern" | "昨日" | "きのう" => (Day(-1), true),
-        "übermorgen" | "uebermorgen" | "明後日" | "あさって" => (Day(2), true),
-        "vorgestern" | "一昨日" | "おととい" => (Day(-2), true),
+        "yesterday" | "yday" | "gestern" | "昨日" | "きのう" | "昨天" => (Day(-1), true),
+        "übermorgen" | "uebermorgen" | "明後日" | "あさって" | "后天" | "後天" => {
+            (Day(2), true)
+        }
+        "vorgestern" | "一昨日" | "おととい" | "前天" => (Day(-2), true),
+        "大后天" | "大後天" => (Day(3), true),
+        "大前天" => (Day(-3), true),
         _ => return None,
     })
 }
@@ -136,8 +143,57 @@ pub fn keyword(w: &str) -> Option<(Keyword, bool)> {
 pub fn is_filler(w: &str) -> bool {
     matches!(
         w,
-        "at" | "on" | "the" | "of" | "um" | "am" | "den" | "der" | "dem" | "and" | "und"
+        "at" | "on"
+            | "the"
+            | "of"
+            | "um"
+            | "am"
+            | "den"
+            | "der"
+            | "dem"
+            | "and"
+            | "und"
+            | "の"
+            | "的"
+            | "在"
     )
+}
+
+/// A part of the day said before the hour, as in 下午3点 or 午後3時.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Period {
+    /// Morning: 12 is midnight.
+    Am,
+    /// Afternoon: 1 to 11 are after noon.
+    Pm,
+    /// Midday (中午): 11 and 12 as they are, 1 to 3 after noon.
+    Noon,
+    /// Evening and night (晚上): 6 to 11 are after noon, 12 is midnight, 1 to 5 the small hours.
+    Night,
+}
+
+impl Period {
+    /// The 24-hour clock hour for an hour said in this part of the day.
+    pub fn hour(self, h: i64) -> i64 {
+        match self {
+            Period::Am if h == 12 => 0,
+            Period::Pm if (1..=11).contains(&h) => h + 12,
+            Period::Noon if h < 11 => h + 12,
+            Period::Night if (6..=11).contains(&h) => h + 12,
+            Period::Night if h == 12 => 0,
+            _ => h,
+        }
+    }
+}
+
+pub fn period(w: &str) -> Option<Period> {
+    Some(match w {
+        "午前" | "上午" | "早上" | "早晨" | "清晨" | "凌晨" | "半夜" => Period::Am,
+        "午後" | "下午" | "傍晚" => Period::Pm,
+        "中午" => Period::Noon,
+        "晚上" | "夜里" | "夜裡" | "夜间" | "夜間" => Period::Night,
+        _ => return None,
+    })
 }
 
 /// Fixed offsets (seconds east of UTC) for common time zone abbreviations.
@@ -186,13 +242,13 @@ pub fn tz_region(w: &str) -> Option<&'static str> {
     })
 }
 
-/// Japanese era name to the Gregorian year before its first year.
+/// Japanese era (or Taiwan's 民國) to the Gregorian year before its first year.
 pub fn era(w: &str) -> Option<i16> {
     Some(match w {
         "令和" => 2018,
         "平成" => 1988,
         "昭和" => 1925,
-        "大正" => 1911,
+        "大正" | "民国" | "民國" => 1911,
         "明治" => 1867,
         _ => return None,
     })

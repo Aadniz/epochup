@@ -11,8 +11,8 @@ mod tests;
 
 use std::ops::Range;
 
-use jiff::Zoned;
 use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
 
 use epoch::Epoch;
 use expr::{Mode, Resolved};
@@ -27,9 +27,15 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn system() -> Ctx {
-        let tz = TimeZone::try_system().unwrap_or(TimeZone::UTC);
+        Ctx::now_in(TimeZone::try_system().unwrap_or(TimeZone::UTC))
+    }
+
+    /// The current time to the millisecond; finer digits would only flicker past.
+    pub fn now_in(tz: TimeZone) -> Ctx {
+        let now = Timestamp::now();
+        let now = Timestamp::from_millisecond(now.as_millisecond()).unwrap_or(now);
         Ctx {
-            now: Zoned::now().with_time_zone(tz.clone()),
+            now: now.to_zoned(tz.clone()),
             tz,
         }
     }

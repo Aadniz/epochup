@@ -14,6 +14,8 @@ use crate::parse::{Ctx, Interpretation, Kind, Stage};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
     pub text: String,
+    /// A short hint shown with the value, like "UTC" or "ms"; never copied.
+    pub tag: Option<String>,
     /// What the format is, shown on hover.
     pub label: String,
 }
@@ -22,8 +24,14 @@ impl Item {
     fn new(text: impl Into<String>, label: impl Into<String>) -> Self {
         Item {
             text: text.into(),
+            tag: None,
             label: label.into(),
         }
+    }
+
+    fn tagged(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
     }
 }
 
@@ -46,10 +54,10 @@ pub fn build(it: &Interpretation, input: &str, ctx: &Ctx) -> Outputs {
             let mut out = from_date(r, &what, ctx);
             if let Some(e) = &it.as_epoch {
                 let z = e.ts.to_zoned(ctx.tz.clone());
-                out.alternatives.push(Item::new(
-                    locale::date(&z),
-                    format!("read as epoch {}", e.unit.name()),
-                ));
+                out.alternatives.push(
+                    Item::new(locale::date(&z), format!("read as epoch {}", e.unit.name()))
+                        .tagged("epoch"),
+                );
             }
             out
         }
@@ -91,35 +99,50 @@ fn from_epoch(e: &Epoch, stage: Stage, ctx: &Ctx) -> Outputs {
 
 fn from_date(r: &Resolved, what: &str, ctx: &Ctx) -> Outputs {
     let ts = r.zoned.timestamp();
-    let mut alternatives = vec![Item::new(
-        ts.as_millisecond().to_string(),
-        "epoch milliseconds",
-    )];
-    if ts.subsec_nanosecond() != 0 {
+    let mut primary = Item::new(seconds(ts).to_string(), "epoch seconds");
+    let mut alternatives =
+        vec![Item::new(ts.as_millisecond().to_string(), "epoch milliseconds").tagged("ms")];
+    // A live value keeps its fraction even on a whole second, so nothing after it jumps.
+    if r.live || ts.subsec_nanosecond() != 0 {
         alternatives.push(Item::new(
             fractional_seconds(ts),
             "epoch seconds with fraction",
         ));
     }
+    // Only a written wall-clock time can be reread as UTC; "now" or "in 3 hours" are instants.
     if !r.explicit_zone
+        && !r.live
         && r.zoned.offset().seconds() != 0
         && let Ok(utc) = r.zoned.datetime().to_zoned(TimeZone::UTC)
     {
-        alternatives.push(Item::new(
-            seconds(utc.timestamp()).to_string(),
-            "epoch if that time were UTC",
-        ));
+        // Two epochs a few hours apart look alike, so both say which zone they assume.
+        primary = primary.tagged("Local");
+        alternatives.push(
+            Item::new(
+                seconds(utc.timestamp()).to_string(),
+                "epoch if that time were UTC",
+            )
+            .tagged("UTC"),
+        );
     }
     for z in &r.readings {
-        alternatives.push(Item::new(
-            seconds(z.timestamp()).to_string(),
-            format!("epoch reading it as {}", z.strftime("%Y-%m-%d")),
-        ));
+        let date = z.strftime("%Y-%m-%d").to_string();
+        alternatives.push(
+            Item::new(
+                seconds(z.timestamp()).to_string(),
+                format!("epoch reading it as {date}"),
+            )
+            .tagged(date),
+        );
     }
     // Shown in local time; a time written for another zone also says how it was written.
     let local = ts.to_zoned(ctx.tz.clone());
     let when = locale::strftime(&local, "%Y-%m-%d (%a) %H:%M:%S %Z");
-    let mut info = format!("{what} → {when} · {}", relative(ts, ctx.now.timestamp()));
+    let mut info = format!("{what} → {when}");
+    let ago = relative(ts, ctx.now.timestamp());
+    if ago != "now" {
+        info.push_str(&format!(" · {ago}"));
+    }
     if r.zoned.offset() != local.offset() {
         info.push_str(&format!(
             " · written as {}",
@@ -130,7 +153,7 @@ fn from_date(r: &Resolved, what: &str, ctx: &Ctx) -> Outputs {
         info.push_str(&format!(" · {note}"));
     }
     Outputs {
-        primary: Item::new(seconds(ts).to_string(), "epoch seconds"),
+        primary,
         alternatives,
         info,
         span: None,
@@ -138,8 +161,14 @@ fn from_date(r: &Resolved, what: &str, ctx: &Ctx) -> Outputs {
     }
 }
 
+/// Formats that don't name their zone are tagged as local time.
 fn date_formats(z: &Zoned, ctx: &Ctx) -> Vec<Item> {
     let utc = z.with_time_zone(TimeZone::UTC);
+    let locale_c = locale::strftime(z, "%c");
+    let mut locale_c = Item::new(locale_c, format!("{} %c", locale::name()));
+    if !locale_c.text.contains(&z.strftime("%Z").to_string()) {
+        locale_c = locale_c.tagged("Local");
+    }
     vec![
         Item::new(
             z.strftime("%Y-%m-%dT%H:%M:%S%.f%:z").to_string(),
@@ -152,7 +181,8 @@ fn date_formats(z: &Zoned, ctx: &Ctx) -> Vec<Item> {
         Item::new(
             z.strftime("%Y-%m-%d %H:%M:%S%.f").to_string(),
             "local time, SQL style",
-        ),
+        )
+        .tagged("Local"),
         Item::new(
             jiff::fmt::rfc2822::to_string(z).unwrap_or_default(),
             "RFC 2822",
@@ -161,9 +191,9 @@ fn date_formats(z: &Zoned, ctx: &Ctx) -> Vec<Item> {
             z.strftime("%a %b %e %H:%M:%S %Z %Y").to_string(),
             "date(1) in the C locale",
         ),
-        Item::new(z.strftime("%d.%m.%Y %H:%M:%S").to_string(), "German"),
-        Item::new(z.strftime("%m/%d/%Y %I:%M:%S %p").to_string(), "US"),
-        Item::new(locale::strftime(z, "%c"), format!("{} %c", locale::name())),
+        Item::new(z.strftime("%d.%m.%Y %H:%M:%S").to_string(), "German").tagged("Local"),
+        Item::new(z.strftime("%m/%d/%Y %I:%M:%S %p").to_string(), "US").tagged("Local"),
+        locale_c,
         Item::new(
             relative(z.timestamp(), ctx.now.timestamp()),
             "relative to now",
@@ -176,6 +206,8 @@ fn seconds(ts: Timestamp) -> i64 {
     ts.as_nanosecond().div_euclid(1_000_000_000) as i64
 }
 
+/// Seconds with the fraction in whole groups of three digits (`.120`, `.120500`),
+/// so that a value ticking by keeps its width.
 fn fractional_seconds(ts: Timestamp) -> String {
     let ns = ts.as_nanosecond();
     let sign = if ns < 0 { "-" } else { "" };
@@ -183,10 +215,11 @@ fn fractional_seconds(ts: Timestamp) -> String {
         ns.unsigned_abs() / 1_000_000_000,
         ns.unsigned_abs() % 1_000_000_000,
     );
-    format!(
-        "{sign}{whole}.{}",
-        format!("{frac:09}").trim_end_matches('0')
-    )
+    let mut frac = format!("{frac:09}");
+    while frac.len() > 3 && frac.ends_with("000") {
+        frac.truncate(frac.len() - 3);
+    }
+    format!("{sign}{whole}.{frac}")
 }
 
 fn zone_desc(z: &Zoned) -> String {
@@ -268,8 +301,7 @@ mod tests {
             "1791919456789",
             "946684800",
             "1234567890",
-            "0",
-            "-86400",
+            "10000000",
             "4102444799",
         ] {
             let Kind::Epoch(e) = interpret(input, &ctx).unwrap().kind else {
@@ -305,12 +337,69 @@ mod tests {
         assert!(out.info.contains("2026-10-13"), "{}", out.info);
     }
 
+    fn tags(out: &Outputs) -> Vec<Option<&str>> {
+        std::iter::once(&out.primary)
+            .chain(&out.alternatives)
+            .map(|i| i.tag.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn tags_say_which_zone() {
+        // A local wall-clock time and its UTC rereading are a few hours apart: both say which.
+        let out = outputs("2026-10-13 21:24:16");
+        assert_eq!(tags(&out), [Some("Local"), Some("ms"), Some("UTC")]);
+        // An instant has no such pair.
+        assert_eq!(tags(&outputs("now")), [None, Some("ms"), None]);
+        assert_eq!(tags(&outputs("2026-10-13T19:24:16Z")), [None, Some("ms")]);
+        // The other reading of an ambiguous date names the date it assumes.
+        assert_eq!(tags(&outputs("03/04/2026"))[3], Some("2026-04-03"));
+        // Dates without a zone in them are local.
+        let out = outputs("1791919456");
+        let local: Vec<&str> = out
+            .alternatives
+            .iter()
+            .filter(|i| i.tag.as_deref() == Some("Local"))
+            .map(|i| i.label.as_str())
+            .collect();
+        assert!(
+            local.contains(&"local time, SQL style")
+                && local.contains(&"German")
+                && local.contains(&"US"),
+            "{local:?}"
+        );
+        assert!(
+            !local.contains(&"ISO 8601") && !local.contains(&"RFC 2822"),
+            "{local:?}"
+        );
+    }
+
     #[test]
     fn explicit_zone_has_no_utc_alternative() {
         let out = outputs("2026-10-13T19:24:16.5Z");
         assert_eq!(out.primary.text, "1791919456");
         let alts: Vec<&str> = out.alternatives.iter().map(|a| a.text.as_str()).collect();
-        assert_eq!(alts, ["1791919456500", "1791919456.5"]);
+        assert_eq!(alts, ["1791919456500", "1791919456.500"]);
+    }
+
+    #[test]
+    fn live_values_keep_their_shape() {
+        // "now" is an instant: no UTC rereading, and the fraction is always there.
+        for input in ["now", "in 3 hours", "2h ago"] {
+            let out = outputs(input);
+            let labels: Vec<&str> = out.alternatives.iter().map(|a| a.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                ["epoch milliseconds", "epoch seconds with fraction"],
+                "{input}"
+            );
+            let fraction = &out.alternatives[1].text;
+            assert_eq!(
+                fraction.split('.').nth(1).map(str::len),
+                Some(3),
+                "{input}: {fraction}"
+            );
+        }
     }
 
     #[test]

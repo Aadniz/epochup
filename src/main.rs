@@ -1,15 +1,13 @@
 mod app;
 mod clipboard;
 mod fonts;
-mod locale;
-mod output;
-mod parse;
 
 use std::cell::RefCell;
 use std::io::Read;
 use std::rc::Rc;
 
 use eframe::egui;
+use epochup::{locale, output, parse};
 
 const USAGE: &str = "\
 usage: epochup              open the popup on the clipboard's contents
@@ -43,7 +41,7 @@ fn main() -> eframe::Result {
     }
 
     // Read the font and the clipboard while the window is being created.
-    let font = std::thread::spawn(fonts::load_cjk);
+    let font = std::thread::spawn(fonts::load);
     let input = args.join(" ");
     let clip_rx = input.is_empty().then(|| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -65,7 +63,7 @@ fn main() -> eframe::Result {
         "epochup",
         options,
         Box::new(move |cc| {
-            fonts::install(&cc.egui_ctx, font.join().ok().flatten());
+            fonts::install(&cc.egui_ctx, font.join().unwrap_or_default());
             Ok(Box::new(app::App::new(cc, input, clip_rx, app_copied)))
         }),
     )?;
@@ -98,4 +96,7 @@ fn eval(args: &[String]) {
         println!("  {:<34} {}", alt.label, alt.text);
     }
     println!("# {}", out.info);
+    if let Some(language) = out.language {
+        println!("# {language}");
+    }
 }

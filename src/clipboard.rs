@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
 
-use crate::parse::{self, Ctx};
+use epochup::parse::{self, Ctx};
 
 /// The flag that makes this program serve its stdin as the clipboard.
 pub const SERVE_FLAG: &str = "--serve-clipboard";

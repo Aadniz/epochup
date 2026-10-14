@@ -7,15 +7,15 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
-use eframe::egui::text::LayoutJob;
+use eframe::egui::text::{LayoutJob, TextWrapping};
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Galley, Key, Margin, Modifiers, Rect, RichText, Sense,
     Stroke, StrokeKind, TextEdit, TextFormat, Vec2, vec2,
 };
 use jiff::tz::TimeZone;
 
-use crate::output::{self, Item, Outputs};
-use crate::parse::{self, Ctx};
+use epochup::output::{self, Item, Outputs};
+use epochup::parse::{self, Ctx};
 
 // The palette of the sway, waybar and foot configs.
 const BG: Color32 = hex(0x191b22);
@@ -361,7 +361,7 @@ impl App {
             );
             return;
         };
-        ui.label(RichText::new(&out.info).size(INFO_SIZE).color(INFO));
+        info_row(ui, &out.info, out.language);
         ui.add_space(8.0);
         // Laid out by hand: a wrapped egui row would give every row the primary's height.
         let values: Vec<_> = std::iter::once(&out.primary)
@@ -614,6 +614,36 @@ impl Value {
     }
 }
 
+/// The line under the input: what was understood on the left and, on the
+/// right, the language it was read in (日本語, Deutsch), unless English.
+fn info_row(ui: &mut egui::Ui, info: &str, language: Option<&str>) {
+    let width = ui.available_width();
+    let font = FontId::proportional(INFO_SIZE);
+    let language = language.map(|name| {
+        ui.painter()
+            .layout_no_wrap(name.to_owned(), font.clone(), LIGHT)
+    });
+    let room = language
+        .as_ref()
+        .map_or(width, |g| width - g.size().x - 12.0);
+    let mut job = LayoutJob::simple_singleline(info.to_owned(), font, INFO);
+    job.wrap = TextWrapping::truncate_at_width(room.max(0.0));
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let height = language
+        .as_ref()
+        .map_or(galley.size().y, |g| g.size().y.max(galley.size().y));
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let elided = galley.elided;
+    ui.painter().galley(rect.left_top(), galley, INFO);
+    if let Some(g) = language {
+        let at = egui::pos2(rect.right() - g.size().x, rect.top());
+        ui.painter().galley(at, g, LIGHT);
+    }
+    if elided {
+        response.on_hover_text(info);
+    }
+}
+
 fn hint_text(text: &str) -> RichText {
     RichText::new(text).color(MUTED).size(INPUT_SIZE)
 }
@@ -664,17 +694,24 @@ fn placeholder(clip: &str, span: Range<usize>) -> LayoutJob {
             .map(|c| if c.is_whitespace() { ' ' } else { c })
             .collect()
     }
+    // Short text is shown whole; long text keeps some context on each side of the match.
+    const SHOWN: usize = 90;
     let before_all = &clip[..span.start];
     let after_all = &clip[span.end..];
+    let (keep_before, keep_after) = if clip.chars().count() <= SHOWN {
+        (usize::MAX, usize::MAX)
+    } else {
+        (30, 60)
+    };
     let before: String = before_all
         .chars()
         .rev()
-        .take(24)
+        .take(keep_before)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
-    let after: String = after_all.chars().take(60).collect();
+    let after: String = after_all.chars().take(keep_after).collect();
     let mut text = String::new();
     if before.len() < before_all.len() {
         text.push('…');

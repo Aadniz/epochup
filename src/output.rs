@@ -44,6 +44,8 @@ pub struct Outputs {
     pub span: Option<Range<usize>>,
     /// Depends on the clock, so it should be refreshed while shown.
     pub live: bool,
+    /// The language the date was read in, said in it (日本語の日付); none for English.
+    pub language: Option<&'static str>,
 }
 
 pub fn build(it: &Interpretation, input: &str, ctx: &Ctx) -> Outputs {
@@ -63,6 +65,10 @@ pub fn build(it: &Interpretation, input: &str, ctx: &Ctx) -> Outputs {
         }
     };
     out.span = Some(it.span.clone());
+    out.language = it
+        .lang
+        .filter(|&code| code != "en")
+        .and_then(crate::lang::label);
     dedupe(&mut out);
     out
 }
@@ -94,6 +100,7 @@ fn from_epoch(e: &Epoch, stage: Stage, ctx: &Ctx) -> Outputs {
         info: format!("epoch {}{found} → {}", e.unit.name(), zone_desc(&z)),
         span: None,
         live: false,
+        language: None,
     }
 }
 
@@ -158,6 +165,7 @@ fn from_date(r: &Resolved, what: &str, ctx: &Ctx) -> Outputs {
         info,
         span: None,
         live: r.live,
+        language: None,
     }
 }
 
@@ -400,6 +408,21 @@ mod tests {
                 "{input}: {fraction}"
             );
         }
+    }
+
+    #[test]
+    fn language_in_its_own_words() {
+        assert_eq!(outputs("2026年10月13日").language, Some("日本語の日付"));
+        assert_eq!(
+            outputs("13. Oktober 2026").language,
+            Some("Datum auf Deutsch")
+        );
+        assert_eq!(
+            outputs("13 October 2026").language,
+            None,
+            "English needs no label"
+        );
+        assert_eq!(outputs("1791919456").language, None);
     }
 
     #[test]

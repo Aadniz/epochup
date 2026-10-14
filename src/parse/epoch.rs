@@ -100,7 +100,7 @@ fn literal_at(text: &str, start: usize) -> Option<Lit> {
         return None;
     }
     if let Some(prev) = text[..start].chars().next_back() {
-        let glued = prev.is_alphanumeric() && !super::lexer::is_cjk(prev);
+        let glued = prev.is_alphanumeric() && !crate::lang::is_unspaced(prev);
         if glued
             || matches!(prev, '.' | '_')
             || (!signed && !at && matches!(prev, '-' | '/' | ':' | '+'))

@@ -11,6 +11,10 @@ jiff = "0.2"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 libc = "0.2"
 
+[[bench]]
+name = "parse"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -8,7 +8,8 @@ use jiff::{Span, ToSpan, Zoned};
 use super::Ctx;
 use super::epoch::is_compact_date;
 use super::lexer::{Kind, Token, normalize};
-use super::names::{self, Keyword, Unit};
+use super::zones;
+use crate::lang::{Meaning as M, Period, Unit};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -18,6 +19,13 @@ pub enum Mode {
     Strong,
     /// Looking for anything date-like inside arbitrary text.
     Weak,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keyword {
+    Now,
+    /// Days from today.
+    Day(i8),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,7 +130,8 @@ impl Parsed {
                     }
                     Some(_) => return false,
                     None => {
-                        if d.strong || (d.named && d.day.is_some()) {
+                        // A named month with a day or a year: `Oct 13`, `October 2026`, 2026年10月
+                        if d.strong || (d.named && (d.day.is_some() || d.year.is_some())) {
                             self.anchors += 1;
                         }
                         self.date = Some(d);
@@ -246,6 +255,24 @@ pub struct Expr {
     pub complete: bool,
 }
 
+/// Whether an expression could begin at token `i`. Most words in prose
+/// can't, and skipping them keeps scanning a large blob cheap.
+pub fn could_start(toks: &[Token], i: usize) -> bool {
+    let t = &toks[i];
+    match &t.kind {
+        Kind::Num { .. } | Kind::Sym(_) => true,
+        Kind::Word(w) => {
+            !t.meanings.is_empty()
+                // ISO 8601's T before a time: T21:24
+                || w == "t"
+                || zones::tz_abbrev(w).is_some()
+                || zones::tz_region(w).is_some()
+                // IANA zones: Europe/Berlin
+                || toks.get(i + 1).is_some_and(|n| n.kind == Kind::Sym('/') && n.start == t.end)
+        }
+    }
+}
+
 /// Parses the longest expression starting at token `start`.
 pub fn parse(toks: &[Token], src: &str, start: usize, mode: Mode) -> Option<Expr> {
     let cur = Cur { t: toks, src, mode };
@@ -315,10 +342,6 @@ fn md(m: u64, d: u64) -> Option<(Option<i16>, i8, i8)> {
     ymd(2000, m, d).map(|(_, m, d)| (None, m, d))
 }
 
-fn is_ordinal_suffix(w: &str) -> bool {
-    matches!(w, "st" | "nd" | "rd" | "th")
-}
-
 struct Cur<'a> {
     t: &'a [Token],
     src: &'a str,
@@ -365,6 +388,78 @@ impl Cur<'_> {
         &self.src[self.t[i].start..self.t[i].end]
     }
 
+    /// The first meaning of word `i` that `pick` accepts, and whether it is strong.
+    fn find<T>(&self, i: usize, pick: impl Fn(M) -> Option<T>) -> Option<(T, bool)> {
+        self.t
+            .get(i)?
+            .meanings
+            .iter()
+            .find_map(|e| pick(e.meaning).map(|t| (t, e.strong)))
+    }
+
+    /// Word `i` can mean `meaning`.
+    fn is(&self, i: usize, meaning: M) -> bool {
+        self.t
+            .get(i)
+            .is_some_and(|t| t.meanings.iter().any(|e| e.meaning == meaning))
+    }
+
+    fn month_name(&self, i: usize) -> Option<(i8, bool)> {
+        self.find(i, |m| match m {
+            M::MonthName(n) => Some(n),
+            _ => None,
+        })
+    }
+
+    fn weekday_name(&self, i: usize) -> Option<(Weekday, bool)> {
+        self.find(i, |m| match m {
+            M::WeekdayName(wd) => Some(wd),
+            _ => None,
+        })
+    }
+
+    /// A unit word. In org-mode offsets (`+2m`) a bare `m` means months; elsewhere (`5m ago`) minutes.
+    fn unit_at(&self, i: usize, org: bool) -> Option<Unit> {
+        if org && self.word(i) == Some("m") {
+            return Some(Unit::Month);
+        }
+        let (unit, _) = self.find(i, |m| match m {
+            M::UnitName(unit) | M::SingleUnit(unit) => Some(unit),
+            _ => None,
+        })?;
+        Some(unit)
+    }
+
+    /// A number written as a word: `a`, `два`, 세.
+    fn count(&self, i: usize) -> Option<u8> {
+        let (n, _) = self.find(i, |m| match m {
+            M::Count(n) => Some(n),
+            _ => None,
+        })?;
+        Some(n)
+    }
+
+    /// A unit that means one of itself: `час`, `tydzień`.
+    fn is_single_unit(&self, i: usize) -> bool {
+        self.t.get(i).is_some_and(|t| {
+            t.meanings
+                .iter()
+                .any(|e| matches!(e.meaning, M::SingleUnit(_)))
+        })
+    }
+
+    fn unit(&self, i: usize) -> Option<Unit> {
+        self.unit_at(i, false)
+    }
+
+    fn day_part(&self, i: usize) -> Option<Period> {
+        let (period, _) = self.find(i, |m| match m {
+            M::DayPart(period) => Some(period),
+            _ => None,
+        })?;
+        Some(period)
+    }
+
     fn component(&self, i: usize, p: &Parsed, depth: i32) -> Option<(usize, Comp)> {
         // org-mode: a lone `.` is today.
         if self.mode == Mode::Whole && self.t.len() == 1 && self.is_sym(i, '.') {
@@ -408,35 +503,47 @@ impl Cur<'_> {
                 | '«' | '»',
             ) => Comp::Filler,
             Kind::Sym('.') if self.adj_num(i + 1).is_none() => Comp::Filler,
-            Kind::Word(w) if names::is_filler(w) => Comp::Filler,
+            Kind::Word(_) if self.is(i, M::Filler) => Comp::Filler,
             _ => return None,
         };
         Some((i + 1, comp))
     }
 
     fn keyword(&self, i: usize) -> Option<(usize, Comp)> {
-        let (k, confident) = names::keyword(self.word(i)?)?;
-        Some((i + 1, Comp::Keyword(k, confident)))
+        let (k, strong) = self.find(i, |m| match m {
+            M::Now => Some(Keyword::Now),
+            M::DayOffset(n) => Some(Keyword::Day(n)),
+            _ => None,
+        })?;
+        Some((i + 1, Comp::Keyword(k, strong)))
     }
 
     /// `3 days`, `2h 30m`, `an hour`, `3日`: counts with units, for natural relatives.
     fn unit_list(&self, mut j: usize) -> Option<(usize, Vec<Rel>)> {
         let mut rels = Vec::new();
         loop {
-            let (n, k, half) = match (self.num(j), self.word(j)) {
-                (Some((v, d)), _) if d <= 6 => (v as i64, j + 1, false),
-                (_, Some("a" | "an" | "one" | "ein" | "einem" | "einer" | "einen")) => {
-                    (1, j + 1, false)
+            let (n, k, half) = if let Some((v, d)) = self.num(j) {
+                if d > 6 {
+                    break;
                 }
-                (_, Some("半")) => (1, j + 1, true),
-                _ => break,
+                (v as i64, j + 1, false)
+            } else if let Some(n) = self.count(j) {
+                (n as i64, j + 1, false)
+            } else if self.is(j, M::Half) {
+                (1, j + 1, true)
+            } else if self.is_single_unit(j) {
+                // `через час`, `tydzień temu`: the unit is its own count.
+                (1, j, false)
+            } else {
+                break;
             };
             // Chinese counts months and weeks with a measure word: 3个月, 两个星期.
-            let measured = matches!(self.word(k), Some("个" | "個"));
+            let measured = self.is(k, M::Measure);
             let k = k + measured as usize;
-            let unit = match self.word(k) {
-                Some("月") if measured => Some(Unit::Month),
-                w => w.and_then(|w| names::unit(w, false)),
+            let unit = if measured && self.is(k, M::MonthMark) {
+                Some(Unit::Month)
+            } else {
+                self.unit(k)
             };
             let Some(unit) = unit else {
                 break;
@@ -458,9 +565,8 @@ impl Cur<'_> {
                 natural: true,
             });
             j = k + 1;
-            let joined = matches!(self.word(j), Some("and" | "und")) || self.is_sym(j, ',');
-            if joined && (self.num(j + 1).is_some() || matches!(self.word(j + 1), Some("a" | "an")))
-            {
+            let joined = self.is(j, M::And) || self.is_sym(j, ',');
+            if joined && (self.num(j + 1).is_some() || self.count(j + 1).is_some()) {
                 j += 1;
             }
         }
@@ -477,14 +583,16 @@ impl Cur<'_> {
         {
             return Some((j + 1, Weekday::from_monday_one_offset(v as i8).ok()?));
         }
-        matches!(self.word(j), Some("日" | "天")).then_some((j + 1, Weekday::Sunday))
+        self.is(j, M::WeekSunday)
+            .then_some((j + 1, Weekday::Sunday))
     }
 
     /// 星期二, 周二, 週二, 礼拜天.
     fn chinese_weekday(&self, i: usize) -> Option<(usize, Weekday)> {
-        match self.word(i)? {
-            "星期" | "礼拜" | "禮拜" | "周" | "週" => self.chinese_day(i + 1),
-            _ => None,
+        if self.is(i, M::WeekWord) {
+            self.chinese_day(i + 1)
+        } else {
+            None
         }
     }
 
@@ -493,15 +601,11 @@ impl Cur<'_> {
         if let Some(day) = self.chinese_day(j) {
             return Some(day);
         }
-        let j = if matches!(self.word(j), Some("の" | "的")) {
-            j + 1
-        } else {
-            j
-        };
+        let j = if self.is(j, M::Filler) { j + 1 } else { j };
         if let Some(day) = self.chinese_weekday(j) {
             return Some(day);
         }
-        let (wd, _) = names::weekday(self.word(j)?, false)?;
+        let (wd, _) = self.weekday_name(j)?;
         Some((j + 1, wd))
     }
 
@@ -545,11 +649,11 @@ impl Cur<'_> {
             }
             let word = self
                 .word(j)
-                .filter(|w| self.adj(j) || (count.is_some() && w.chars().count() > 1));
-            let unit = word.and_then(|w| names::unit(w, true));
-            let weekday = word
-                .filter(|_| self.adj(j))
-                .and_then(|w| names::weekday(w, false));
+                .is_some_and(|w| self.adj(j) || (count.is_some() && w.chars().count() > 1));
+            let unit = word.then(|| self.unit_at(j, true)).flatten();
+            let weekday = (word && self.adj(j))
+                .then(|| self.weekday_name(j))
+                .flatten();
             let whole = self.mode == Mode::Whole;
             let (rel, takes_word) = match (count, unit, weekday) {
                 // Units always need a count: `-s` is a command-line flag, not a second ago.
@@ -596,58 +700,49 @@ impl Cur<'_> {
         }
 
         // 3 days ago, 2h 30m ago, 3 days from now, 3日後, 2週間前, 3天后, 半小时前
-        if (self.num(i).is_some() || self.word(i) == Some("半"))
+        if (self.num(i).is_some()
+            || self.count(i).is_some()
+            || self.is(i, M::Half)
+            || self.is_single_unit(i))
             && let Some((j, rels)) = self.unit_list(i)
         {
-            return match (self.word(j), self.word(j + 1)) {
-                (Some("ago" | "前" | "以前" | "之前"), _) => {
-                    Some((j + 1, Comp::Rel(negate(rels))))
-                }
-                (Some("later" | "hence" | "後" | "后" | "以后" | "之后" | "以後" | "之後"), _) => {
-                    Some((j + 1, Comp::Rel(rels)))
-                }
-                (Some("from"), Some("now")) => Some((j + 2, Comp::Rel(rels))),
-                _ => None,
+            return if self.is(j, M::Ago) {
+                Some((j + 1, Comp::Rel(negate(rels))))
+            } else if self.is(j, M::Later) {
+                Some((j + 1, Comp::Rel(rels)))
+            } else {
+                None
             };
         }
 
-        let w = self.word(i)?;
-        match w {
-            "in" => return self.unit_list(i + 1).map(|(j, rels)| (j, Comp::Rel(rels))),
-            "vor" => {
-                return self
-                    .unit_list(i + 1)
-                    .map(|(j, rels)| (j, Comp::Rel(negate(rels))));
-            }
-            _ => {}
+        // in 3 days, vor 3 Tagen
+        if self.is(i, M::In) {
+            return self.unit_list(i + 1).map(|(j, rels)| (j, Comp::Rel(rels)));
+        }
+        if self.is(i, M::Before) {
+            let past = self.unit_list(i + 1);
+            return past.map(|(j, rels)| (j, Comp::Rel(negate(rels))));
         }
         // A week, month or year away, and perhaps a day of that week:
         // 下周一, 上周五, 来週の金曜日, 下个星期一, 下个月, 来年
-        let shift = match w {
-            "来週" | "下周" | "下週" => Some((Unit::Week, 1, i + 1)),
-            "先週" | "上周" | "上週" => Some((Unit::Week, -1, i + 1)),
-            "今週" | "这周" | "這週" | "本周" | "本週" => Some((Unit::Week, 0, i + 1)),
-            "来月" => Some((Unit::Month, 1, i + 1)),
-            "先月" => Some((Unit::Month, -1, i + 1)),
-            "今月" => Some((Unit::Month, 0, i + 1)),
-            "来年" | "明年" => Some((Unit::Year, 1, i + 1)),
-            "去年" | "昨年" => Some((Unit::Year, -1, i + 1)),
-            "今年" => Some((Unit::Year, 0, i + 1)),
-            "下个" | "下個" | "上个" | "上個" | "这个" | "這個" => {
-                let n = match w {
-                    "下个" | "下個" => 1,
-                    "上个" | "上個" => -1,
-                    _ => 0,
-                };
-                match self.word(i + 1) {
-                    Some("月") => Some((Unit::Month, n, i + 2)),
-                    Some("星期" | "礼拜" | "禮拜" | "周" | "週") => {
-                        Some((Unit::Week, n, i + 2))
-                    }
-                    _ => return None,
-                }
-            }
+        let shift = if let Some(((unit, n), _)) = self.find(i, |m| match m {
+            M::Shift(unit, n) => Some((unit, n)),
             _ => None,
+        }) {
+            Some((unit, n as i64, i + 1))
+        } else if let Some((n, _)) = self.find(i, |m| match m {
+            M::NextMeasured(n) => Some(n as i64),
+            _ => None,
+        }) {
+            if self.is(i + 1, M::MonthMark) {
+                Some((Unit::Month, n, i + 2))
+            } else if self.is(i + 1, M::WeekWord) {
+                Some((Unit::Week, n, i + 2))
+            } else {
+                return None;
+            }
+        } else {
+            None
         };
         if let Some((unit, n, j)) = shift {
             if unit == Unit::Week
@@ -662,17 +757,12 @@ impl Cur<'_> {
             };
             return Some((j, Comp::Rel(vec![rel])));
         }
-        let dir = match w {
-            "next" | "coming" | "nächste" | "nächsten" | "nächster" | "nächstes" | "kommende"
-            | "kommenden" => 1,
-            "last" | "previous" | "past" | "letzte" | "letzten" | "letzter" | "letztes"
-            | "vorige" | "vorigen" => -1,
-            "this" | "diese" | "diesen" | "dieser" | "dieses" => 0,
-            "übernächste" | "übernächsten" => 2,
-            _ => return None,
-        };
+        let (dir, _) = self.find(i, |m| match m {
+            M::Next(n) => Some(n as i64),
+            _ => None,
+        })?;
         let next = self.word(i + 1)?;
-        if let Some((wd, _)) = names::weekday(next, false) {
+        if let Some((wd, _)) = self.weekday_name(i + 1) {
             let comp = if dir == 0 {
                 Comp::Weekday(wd, true)
             } else {
@@ -680,7 +770,7 @@ impl Cur<'_> {
             };
             return Some((i + 2, comp));
         }
-        let unit = names::unit(next, false).filter(|_| next.chars().count() > 1)?;
+        let unit = self.unit(i + 1).filter(|_| next.chars().count() > 1)?;
         Some((
             i + 2,
             Comp::Rel(vec![Rel::Units {
@@ -694,7 +784,7 @@ impl Cur<'_> {
     /// `w42`, `KW42`, `W42-2`, `week 42`. ISO weeks with a year are parsed by [`Self::numeric_date`].
     fn iso_week(&self, i: usize) -> Option<(usize, Comp)> {
         let w = self.word(i)?;
-        let spaced = matches!(w, "kw" | "cw" | "wk" | "week" | "woche");
+        let spaced = self.is(i, M::WeekNumber);
         if !(spaced || w == "w") || self.mode == Mode::Strong {
             return None;
         }
@@ -808,7 +898,15 @@ impl Cur<'_> {
                 return Some((j, Comp::IsoWeek(Some(a as i16), week as i8, wd)));
             }
             let sep = sep?;
-            let (b, bd) = self.adj_num(i + 2)?;
+            // Korean (and Hungarian) put a space after each dot: 2026. 10. 13.
+            let after = |k: usize| {
+                if sep == '.' {
+                    self.num(k)
+                } else {
+                    self.adj_num(k)
+                }
+            };
+            let (b, bd) = after(i + 2)?;
             // Ordinal date: 2026-286
             if bd == 3 && sep == '-' {
                 if !(1..=366).contains(&b) || self.is_sym(i + 3, '-') {
@@ -820,7 +918,7 @@ impl Cur<'_> {
                 return None;
             }
             if self.is_sym(i + 3, sep) && self.adj(i + 3) {
-                let (c, cd) = self.adj_num(i + 4)?;
+                let (c, cd) = after(i + 4)?;
                 if cd > 2 {
                     return None;
                 }
@@ -928,30 +1026,33 @@ impl Cur<'_> {
         let whole = self.mode == Mode::Whole;
         let mut j = i;
         // zh_TW writes the Common Era out: 西元2026年
-        if matches!(self.word(j), Some("西元" | "公元")) && self.num(j + 1).is_some() {
+        if self.is(j, M::CommonEra) && self.num(j + 1).is_some() {
             j += 1;
         }
         let mut year = None;
-        if let Some(base) = self.word(j).and_then(names::era) {
-            let n = match (self.num(j + 1), self.word(j + 1)) {
-                (Some((v, _)), _) => v as i16,
-                (_, Some("元")) => 1,
-                _ => return None,
+        if let Some((base, _)) = self.find(j, |m| match m {
+            M::Era(base) => Some(base),
+            _ => None,
+        }) {
+            let n = match self.num(j + 1) {
+                Some((v, _)) => v as i16,
+                None if self.is(j + 1, M::FirstYear) => 1,
+                None => return None,
             };
-            if self.word(j + 2) != Some("年") {
+            if !self.is(j + 2, M::YearMark) {
                 return None;
             }
             year = Some(base + n);
             j += 3;
         } else if let Some((v, d)) = self.num(j)
-            && self.word(j + 1) == Some("年")
+            && self.is(j + 1, M::YearMark)
         {
             year = Some(if d == 2 { pivot(v) } else { v as i16 });
             j += 2;
         }
         let mut month = None;
         if let Some((v, _)) = self.num(j)
-            && self.word(j + 1) == Some("月")
+            && self.is(j + 1, M::MonthMark)
             && (1..=12).contains(&v)
         {
             month = Some(v as i8);
@@ -959,7 +1060,7 @@ impl Cur<'_> {
         }
         let mut day = None;
         if let Some((v, _)) = self.num(j)
-            && matches!(self.word(j + 1), Some("日" | "号" | "號"))
+            && self.is(j + 1, M::DayMark)
             && (1..=31).contains(&v)
         {
             day = Some(v as i8);
@@ -1034,7 +1135,7 @@ impl Cur<'_> {
                 return None;
             }
             let mut j = i + 1;
-            if (self.word(j).is_some_and(is_ordinal_suffix) || self.is_sym(j, '.')) && self.adj(j) {
+            if (self.is(j, M::OrdinalSuffix) || self.is_sym(j, '.')) && self.adj(j) {
                 j += 1;
             }
             let mut sep = None;
@@ -1043,10 +1144,10 @@ impl Cur<'_> {
             {
                 sep = Some(c);
                 j += 1;
-            } else if self.word(j) == Some("of") {
+            } else if self.is(j, M::Of) {
                 j += 1;
             }
-            let (month, _) = names::month(self.word(j)?)?;
+            let (month, _) = self.month_name(j)?;
             if sep.is_some() && !self.adj(j) {
                 return None;
             }
@@ -1085,7 +1186,7 @@ impl Cur<'_> {
         }
 
         // Month first: Oct 13, 2026 / October 13th / Oct-13-2026 / Oct 2026 / Oct
-        let (month, confident) = names::month(self.word(i)?)?;
+        let (month, confident) = self.month_name(i)?;
         let mut j = i + 1;
         if self.is_sym(j, '.') && self.adj(j) {
             j += 1;
@@ -1111,7 +1212,7 @@ impl Cur<'_> {
             } else if vd <= 2 && (1..=31).contains(&v) && !is_time {
                 date.day = Some(v as i8);
                 j += 1;
-                if self.word(j).is_some_and(is_ordinal_suffix) && self.adj(j) {
+                if self.is(j, M::OrdinalSuffix) && self.adj(j) {
                     j += 1;
                 }
                 if let Some(sep) = sep {
@@ -1127,8 +1228,11 @@ impl Cur<'_> {
                 }
             }
         }
-        // A bare month name only counts as the whole input; "may" needs a day in prose.
-        if !whole && (date.day.is_none() || (!confident && date.year.is_none())) {
+        // In text a month name needs a day, or a year (`Updated October 2026`);
+        // a weak one like "may" needs a year with its day, and a capital without one.
+        let capital = self.raw(i).starts_with(char::is_uppercase);
+        let month_year = date.day.is_none() && date.year.is_some() && (confident || capital);
+        if !whole && ((date.day.is_none() && !month_year) || (!confident && date.year.is_none())) {
             return None;
         }
         valid(&date).then_some((j, Comp::Date(date, None)))
@@ -1146,9 +1250,14 @@ impl Cur<'_> {
 
     /// `pm`, `PM`, `p.m.`, and a glued `9p`.
     fn ampm(&self, j: usize) -> Option<(usize, bool)> {
+        if let Some((pm, _)) = self.find(j, |m| match m {
+            M::AmPm(pm) => Some(pm),
+            _ => None,
+        }) {
+            return Some((j + 1, pm));
+        }
         let w = self.word(j)?;
         match w {
-            "am" | "pm" => Some((j + 1, w == "pm")),
             "a" | "p" => {
                 if self.is_sym(j + 1, '.')
                     && self.adj(j + 1)
@@ -1172,16 +1281,13 @@ impl Cur<'_> {
     }
 
     fn time(&self, i: usize) -> Option<(usize, Comp)> {
-        if let Some(w) = self.word(i) {
-            let fixed = match w {
-                "noon" | "mittag" | "mittags" | "正午" => Some(12),
-                "中午" if self.num(i + 1).is_none() => Some(12),
-                "midnight" | "mitternacht" | "午夜" => Some(0),
-                _ => None,
-            };
-            if let Some(h) = fixed {
-                return Some((i + 1, Comp::Time(TimePart::hm(h, 0))));
-            }
+        // noon, Mittag, and 中午 on its own; in 中午1点 it is a part of the day.
+        if let Some((h, _)) = self.find(i, |m| match m {
+            M::Clock(h) => Some(h),
+            _ => None,
+        }) && !(self.day_part(i).is_some() && self.num(i + 1).is_some())
+        {
+            return Some((i + 1, Comp::Time(TimePart::hm(h, 0))));
         }
         let mut j = i;
         let iso_t = self.word(j) == Some("t") && self.adj_num(j + 1).is_some();
@@ -1189,15 +1295,22 @@ impl Cur<'_> {
             j += 1;
         }
         // 午後3時, 下午3点, 晚上8点
-        let period = self.word(j).and_then(names::period);
+        let mut period = self.day_part(j);
         if period.is_some() {
             j += 1;
         }
         let mut pm = None;
-        let (h, hd) = self.num(j)?;
+        // The hour may be a number word, but then needs a marker: 오후 세 시, บ่ายสามโมง.
+        let count_hour = self.num(j).is_none();
+        let (h, hd) = match self.num(j) {
+            Some(n) => n,
+            None => (self.count(j)? as u64, 1),
+        };
         let hour_at = j;
         let (mut hh, mut mm, mut ss, mut ns, mut seconds) = (h as i64, 0i64, 0i64, 0i32, false);
         let mut clock = false;
+        // An hour marker, word or part of the day, as opposed to digits and colons.
+        let mut marked = false;
         if iso_t && (hd == 4 || hd == 6) {
             // Basic format: T2124, T212416
             hh = (h / 10u64.pow(hd as u32 - 2)) as i64;
@@ -1244,28 +1357,38 @@ impl Cur<'_> {
                     return None;
                 }
                 clock = true;
-            } else if matches!(self.word(j), Some("時" | "时" | "点" | "點")) {
+            } else if let Some((from, _)) = self.find(j, |m| match m {
+                M::HourFrom(h) => Some(h),
+                _ => None,
+            }) {
+                // Thai 2 ทุ่ม: hours counted from 18:00.
+                hh += from as i64;
                 j += 1;
                 clock = true;
+                marked = true;
+            } else if self.is(j, M::HourMark) {
+                j += 1;
+                clock = true;
+                marked = true;
                 let mut minutes = true;
                 if let Some((m, _)) = self.num(j)
-                    && self.word(j + 1) == Some("分")
+                    && self.is(j + 1, M::MinuteMark)
                 {
                     mm = m as i64;
                     j += 2;
                     if let Some((s, _)) = self.num(j)
-                        && self.word(j + 1) == Some("秒")
+                        && self.is(j + 1, M::SecondMark)
                     {
                         ss = s as i64;
                         seconds = true;
                         j += 2;
                     }
-                } else if self.word(j) == Some("半") {
+                } else if self.is(j, M::Half) {
                     mm = 30;
                     j += 1;
                 } else if let Some((q, _)) = self.num(j)
                     && (1..=3).contains(&q)
-                    && self.word(j + 1) == Some("刻")
+                    && self.is(j + 1, M::Quarter)
                 {
                     // 3点一刻 is a quarter past three.
                     mm = 15 * q as i64;
@@ -1284,7 +1407,7 @@ impl Cur<'_> {
             } else if self.is_sym(j, '.')
                 && self.adj(j)
                 && let Some((m, 2)) = self.adj_num(j + 1)
-                && self.word(j + 2) == Some("uhr")
+                && self.is(j + 2, M::OClock)
             {
                 // German: 21.30 Uhr
                 mm = m as i64;
@@ -1293,26 +1416,48 @@ impl Cur<'_> {
         } else {
             return None;
         }
-        if (1..=12).contains(&hh)
+        if !count_hour
+            && (1..=12).contains(&hh)
             && let Some((k, is_pm)) = self.ampm(j)
         {
             pm = Some(is_pm);
             j = k;
             clock = true;
         }
-        if self.word(j) == Some("uhr") {
+        if self.is(j, M::OClock) {
             j += 1;
             clock = true;
+            marked = true;
+        }
+        // `at` or `@` before the hour, and whether it is a strong one.
+        let at = hour_at.checked_sub(1).and_then(|k| {
+            if self.is_sym(k, '@') {
+                return Some(true);
+            }
+            let (_, strong) = self.find(k, |m| (m == M::At).then_some(()))?;
+            Some(strong)
+        });
+        // A part of the day after the hour: `в 3 часа дня`, `o 8 rano`, `4 โมงเย็น`.
+        // After a bare number it needs an `at` or the whole input: `3 дня` is three days.
+        if period.is_none()
+            && (clock || at.is_some() || (self.mode == Mode::Whole && self.unit(j).is_none()))
+            && let Some(after) = self.day_part(j)
+        {
+            period = Some(after);
+            j += 1;
         }
         if period.is_some() {
             clock = true;
+            marked = true;
+        }
+        if count_hour && !marked {
+            return None;
         }
         if !clock {
-            // A bare hour after "at": `tomorrow at 9`
-            let after_at = hour_at > 0
-                && (matches!(self.word(hour_at - 1), Some("at" | "um" | "gegen"))
-                    || self.is_sym(hour_at - 1, '@'));
-            if !after_at || hd > 2 {
+            // A bare hour after "at": `tomorrow at 9`. A weak `at`, like Polish `o`
+            // (Spanish "or"), only counts as the whole input.
+            let bare = at.is_some_and(|strong| strong || self.mode == Mode::Whole);
+            if !bare || hd > 2 || count_hour {
                 return None;
             }
         }
@@ -1402,10 +1547,10 @@ impl Cur<'_> {
             // In prose only shouting counts: `CEST`, not the German word "ist".
             let upper = !self.raw(i).chars().any(char::is_lowercase);
             if self.mode == Mode::Whole || upper {
-                if let Some(secs) = names::tz_abbrev(w) {
+                if let Some(secs) = zones::tz_abbrev(w) {
                     return Some((i + 1, Comp::Zone(fixed(secs)?, ZoneKind::Abbrev)));
                 }
-                if let Some(tz) = names::tz_region(w).and_then(|n| TimeZone::get(n).ok()) {
+                if let Some(tz) = zones::tz_region(w).and_then(|n| TimeZone::get(n).ok()) {
                     return Some((i + 1, Comp::Zone(tz, ZoneKind::Named)));
                 }
             }
@@ -1441,9 +1586,16 @@ impl Cur<'_> {
         if let Some((j, wd)) = self.chinese_weekday(i) {
             return Some((j, Comp::Weekday(wd, true)));
         }
-        let w = self.word(i)?;
         let in_parens = i > 0 && self.is_sym(i - 1, '(') && self.is_sym(i + 1, ')');
-        let (wd, confident) = names::weekday(w, in_parens)?;
+        let paren = || {
+            self.find(i, |m| match m {
+                M::ParenWeekday(wd) => Some(wd),
+                _ => None,
+            })
+        };
+        let (wd, confident) = self
+            .weekday_name(i)
+            .or_else(|| in_parens.then(paren).flatten())?;
         // In prose, the German "Do"/"So" and English "sun"/"sat" must be capitalized.
         if !confident && self.mode != Mode::Whole && !self.raw(i).starts_with(char::is_uppercase) {
             return None;
@@ -1478,7 +1630,7 @@ impl Cur<'_> {
             return None;
         }
         let mut j = i + 1;
-        let ordinal = self.word(j).is_some_and(is_ordinal_suffix) && self.adj(j);
+        let ordinal = self.is(j, M::OrdinalSuffix) && self.adj(j);
         let german_dot = self.mode == Mode::Whole && self.is_sym(j, '.') && self.adj(j);
         if ordinal || german_dot {
             j += 1;
@@ -1633,7 +1785,9 @@ fn weekday_name(wd: Weekday) -> &'static str {
     ][wd.to_monday_zero_offset() as usize]
 }
 
-pub fn resolve(p: &Parsed, ctx: &Ctx, mode: Mode) -> Option<Resolved> {
+/// Resolves a parsed expression to an instant. `year_offset` is the era of
+/// the text's language: Thai 2569 is 2026 (see `Lang::year_offset`).
+pub fn resolve(p: &Parsed, ctx: &Ctx, mode: Mode, year_offset: i16) -> Option<Resolved> {
     let tz = p
         .zone
         .as_ref()
@@ -1680,11 +1834,21 @@ pub fn resolve(p: &Parsed, ctx: &Ctx, mode: Mode) -> Option<Resolved> {
         let wd = p.weekday.unwrap_or(Weekday::Monday);
         (ISOWeekDate::new(year, week, wd).ok()?.date(), vec![])
     } else if let Some(d) = &p.date {
-        let (date, mut alts) = fill(d.year, d.month, d.day, today, future)?;
+        // Thai 2569 is 2026; a year that low in Thai text is already the common era.
+        let era = |y: Option<i16>| {
+            y.map(|y| {
+                if year_offset != 0 && y > 2200 {
+                    y - year_offset
+                } else {
+                    y
+                }
+            })
+        };
+        let (date, mut alts) = fill(era(d.year), d.month, d.day, today, future)?;
         let ambiguous = d
             .alts
             .iter()
-            .filter_map(|&(y, m, day)| fill(y, Some(m), Some(day), today, future));
+            .filter_map(|&(y, m, day)| fill(era(y), Some(m), Some(day), today, future));
         alts.splice(0..0, ambiguous.map(|(date, _)| date));
         (date, alts)
     } else if let Some(wd) = p.weekday {
@@ -1696,10 +1860,11 @@ pub fn resolve(p: &Parsed, ctx: &Ctx, mode: Mode) -> Option<Resolved> {
     let mut note = None;
     if let (Some(d), Some(wd)) = (&p.date, p.weekday)
         && p.iso_week.is_none()
-        && d.day.is_some()
         && date.weekday() != wd
     {
-        // A weekday with a partial date picks a date that falls on it: "friday the 13th".
+        // A weekday with a day but no month or year picks a date that falls on
+        // it ("friday the 13th"). Otherwise the date stands, and the note says
+        // the weekday didn't fit, so no understood word is silently dropped.
         if let Some(found) = matching_weekday(d, date, wd, future) {
             date = found;
             alts.clear();

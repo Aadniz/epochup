@@ -1,10 +1,12 @@
 //! Splits input into numbers, words and symbols, keeping byte spans into the original text.
 
+use crate::lang::{Entry, Part, Phrase, Word, is_unspaced, lexicon};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// A run of ASCII (or fullwidth) digits. `val` saturates for very long runs.
     Num { val: u64, digits: u8 },
-    /// A lowercased run of letters, or a known Japanese word.
+    /// A lowercased run of letters, a known CJK word, or a known phrase.
     Word(String),
     /// Any other non-whitespace character, normalized to ASCII where a fullwidth form exists.
     Sym(char),
@@ -15,155 +17,11 @@ pub struct Token {
     pub kind: Kind,
     pub start: usize,
     pub end: usize,
+    /// What a word can mean, looked up once here so the grammar never hashes.
+    pub meanings: &'static [Entry],
+    /// Phrases this word may start.
+    phrases: &'static [Phrase],
 }
-
-/// Japanese and Chinese words the grammar knows. CJK text has no spaces, so
-/// the lexer splits it by longest match against this list. Runs of CJK
-/// numerals become numbers, and other characters single-character words.
-const CJK_WORDS: &[&str] = &[
-    // Japanese
-    "年",
-    "月",
-    "日",
-    "時",
-    "分",
-    "秒",
-    "半",
-    "午前",
-    "午後",
-    "正午",
-    "曜日",
-    "月曜日",
-    "火曜日",
-    "水曜日",
-    "木曜日",
-    "金曜日",
-    "土曜日",
-    "日曜日",
-    "月曜",
-    "火曜",
-    "水曜",
-    "木曜",
-    "金曜",
-    "土曜",
-    "日曜",
-    "今日",
-    "本日",
-    "明日",
-    "昨日",
-    "明後日",
-    "一昨日",
-    "今",
-    "後",
-    "前",
-    "来週",
-    "先週",
-    "今週",
-    "来月",
-    "先月",
-    "今月",
-    "来年",
-    "去年",
-    "昨年",
-    "今年",
-    "週間",
-    "週",
-    "ヶ月",
-    "か月",
-    "カ月",
-    "ケ月",
-    "箇月",
-    "時間",
-    "令和",
-    "平成",
-    "昭和",
-    "大正",
-    "明治",
-    "元",
-    "あした",
-    "あす",
-    "きのう",
-    "きょう",
-    "あさって",
-    "おととい",
-    "の",
-    // Chinese, simplified and traditional
-    "时",
-    "点",
-    "點",
-    "号",
-    "號",
-    "刻",
-    "天",
-    "星期",
-    "礼拜",
-    "禮拜",
-    "周",
-    "小时",
-    "小時",
-    "钟头",
-    "鐘頭",
-    "分钟",
-    "分鐘",
-    "秒钟",
-    "秒鐘",
-    "个",
-    "個",
-    "今天",
-    "明天",
-    "昨天",
-    "后天",
-    "後天",
-    "前天",
-    "大后天",
-    "大後天",
-    "大前天",
-    "现在",
-    "現在",
-    "上午",
-    "下午",
-    "早上",
-    "早晨",
-    "清晨",
-    "中午",
-    "晚上",
-    "傍晚",
-    "夜里",
-    "夜裡",
-    "夜间",
-    "夜間",
-    "凌晨",
-    "半夜",
-    "午夜",
-    "下周",
-    "下週",
-    "上周",
-    "上週",
-    "这周",
-    "這週",
-    "本周",
-    "本週",
-    "下个",
-    "下個",
-    "上个",
-    "上個",
-    "这个",
-    "這個",
-    "明年",
-    "后",
-    "以后",
-    "之后",
-    "以後",
-    "之後",
-    "以前",
-    "之前",
-    "民国",
-    "民國",
-    "西元",
-    "公元",
-    "的",
-    "在",
-];
 
 /// A CJK digit: 〇 一 二 … 九, and 两 for two.
 fn cjk_digit(c: char) -> Option<u64> {
@@ -218,16 +76,22 @@ pub fn normalize(c: char) -> char {
     match c {
         '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
         '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+        // Thai digits
+        '\u{0E50}'..='\u{0E59}' => char::from_u32(c as u32 - 0x0E50 + '0' as u32).unwrap_or(c),
         _ => c,
     }
 }
 
-pub fn is_cjk(c: char) -> bool {
-    matches!(c,
-        '〇' | '\u{3040}'..='\u{30FF}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+/// Splits text into tokens. CJK text has no spaces, so it is split by
+/// longest match against the lexicon's words; runs of CJK numerals become
+/// numbers, and other characters single-character words. Phrases from the
+/// lexicon (`from now`) are joined into one word token.
+pub fn lex(src: &str) -> Vec<Token> {
+    join_phrases(split(src))
 }
 
-pub fn lex(src: &str) -> Vec<Token> {
+fn split(src: &str) -> Vec<Token> {
+    let lexicon = lexicon();
     let mut out = Vec::new();
     let mut it = src.char_indices().peekable();
     while let Some(&(start, raw)) = it.peek() {
@@ -251,14 +115,12 @@ pub fn lex(src: &str) -> Vec<Token> {
                 kind: Kind::Num { val, digits },
                 start,
                 end,
+                meanings: &[],
+                phrases: &[],
             });
-        } else if is_cjk(c) {
+        } else if is_unspaced(c) {
             let rest = &src[start..];
-            let known = CJK_WORDS
-                .iter()
-                .filter(|w| rest.starts_with(**w))
-                .max_by_key(|w| w.len())
-                .copied();
+            let known = lexicon.unspaced_word(rest);
             let numeral_len: usize = rest
                 .chars()
                 .take_while(|&c| is_cjk_numeral(c))
@@ -269,11 +131,11 @@ pub fn lex(src: &str) -> Vec<Token> {
             let number = (numeral_len > known.map_or(0, str::len))
                 .then(|| cjk_number(numeral))
                 .flatten();
-            let (kind, text) = match number {
-                Some((val, digits)) => (Kind::Num { val, digits }, numeral),
+            let (kind, text, known) = match number {
+                Some((val, digits)) => (Kind::Num { val, digits }, numeral, None),
                 None => {
                     let word = known.unwrap_or(&rest[..raw.len_utf8()]);
-                    (Kind::Word(word.to_string()), word)
+                    (Kind::Word(word.to_string()), word, lexicon.word(word))
                 }
             };
             for _ in text.chars() {
@@ -283,22 +145,27 @@ pub fn lex(src: &str) -> Vec<Token> {
                 kind,
                 start,
                 end: start + text.len(),
+                meanings: known.map_or(&[], |w| &w.entries),
+                phrases: known.map_or(&[], |w| &w.phrases),
             });
         } else if c.is_alphabetic() {
             let (mut word, mut end) = (String::new(), start);
             while let Some(&(j, r)) = it.peek() {
                 let d = normalize(r);
-                if !d.is_alphabetic() || is_cjk(d) {
+                if !d.is_alphabetic() || is_unspaced(d) {
                     break;
                 }
                 word.extend(d.to_lowercase());
                 end = j + r.len_utf8();
                 it.next();
             }
+            let known: Option<&'static Word> = lexicon.word(&word);
             out.push(Token {
                 kind: Kind::Word(word),
                 start,
                 end,
+                meanings: known.map_or(&[], |w| &w.entries),
+                phrases: known.map_or(&[], |w| &w.phrases),
             });
         } else {
             it.next();
@@ -306,10 +173,72 @@ pub fn lex(src: &str) -> Vec<Token> {
                 kind: Kind::Sym(c),
                 start,
                 end: start + raw.len_utf8(),
+                meanings: &[],
+                phrases: &[],
             });
         }
     }
     out
+}
+
+/// Joins the tokens of a known phrase (`from now`, `il y a`, `après-demain`) into one word.
+fn join_phrases(tokens: Vec<Token>) -> Vec<Token> {
+    let lexicon = lexicon();
+    // Most text has no phrases at all: find them first, and only then rebuild.
+    let mut joins: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let phrase = tokens[i].phrases.iter().find(|p| matches_at(&tokens, i, p));
+        match phrase {
+            Some(p) => {
+                joins.push((i, i + p.rest.len(), p.key));
+                i += p.rest.len() + 1;
+            }
+            None => i += 1,
+        }
+    }
+    if joins.is_empty() {
+        return tokens;
+    }
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut joins = joins.into_iter().peekable();
+    let mut phrase_start = 0;
+    for (k, token) in tokens.into_iter().enumerate() {
+        match joins.peek() {
+            Some(&(first, last, key)) if k >= first => {
+                if k == first {
+                    phrase_start = token.start;
+                }
+                if k == last {
+                    let known = lexicon.word(key);
+                    out.push(Token {
+                        kind: Kind::Word(key.to_string()),
+                        start: phrase_start,
+                        end: token.end,
+                        meanings: known.map_or(&[], |w| &w.entries),
+                        phrases: &[],
+                    });
+                    joins.next();
+                }
+            }
+            _ => out.push(token),
+        }
+    }
+    out
+}
+
+fn matches_at(tokens: &[Token], i: usize, phrase: &Phrase) -> bool {
+    phrase.rest.iter().enumerate().all(|(k, part)| {
+        let Some(t) = tokens.get(i + 1 + k) else {
+            return false;
+        };
+        let glued = t.start == tokens[i + k].end;
+        match (part, &t.kind) {
+            (Part::Word(w, g), Kind::Word(tw)) => w == tw && *g == glued,
+            (Part::Sym(c, g), Kind::Sym(tc)) => c == tc && *g == glued,
+            _ => false,
+        }
+    })
 }
 
 #[cfg(test)]

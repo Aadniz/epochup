@@ -4,7 +4,7 @@
 pub mod epoch;
 pub mod expr;
 pub mod lexer;
-pub mod names;
+mod zones;
 
 #[cfg(test)]
 mod tests;
@@ -14,6 +14,7 @@ use std::ops::Range;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 
+use crate::lang::lexicon;
 use epoch::Epoch;
 use expr::{Mode, Resolved};
 use lexer::{Kind as Tok, Token};
@@ -67,6 +68,8 @@ pub struct Interpretation {
     pub stage: Stage,
     /// The same input read as an epoch, when a date reading won (`20261013`, `14`).
     pub as_epoch: Option<Epoch>,
+    /// The language of the understood words, like `ja`; none without words (`2026-10-13`).
+    pub lang: Option<&'static str>,
 }
 
 impl Interpretation {
@@ -76,6 +79,7 @@ impl Interpretation {
             kind: Kind::Epoch(e),
             stage,
             as_epoch: None,
+            lang: None,
         }
     }
 }
@@ -93,15 +97,23 @@ pub fn interpret(text: &str, ctx: &Ctx) -> Option<Interpretation> {
         fallback = Some(d.epoch);
     }
     let toks = lexer::lex(text);
+    // Thai text counts years in the Buddhist era, as do users with a Thai locale.
+    let era = toks
+        .iter()
+        .flat_map(|t| t.meanings)
+        .map(|e| e.year_offset)
+        .find(|&o| o != 0)
+        .unwrap_or_else(|| lexicon().default_year_offset());
     let span = |start: usize, end: usize| toks[start].start..toks[end - 1].end;
 
     if let Some(e) = expr::parse(&toks, text, 0, Mode::Whole)
         && e.complete
-        && let Some(r) = expr::resolve(&e.parsed, ctx, Mode::Whole)
+        && let Some(r) = expr::resolve(&e.parsed, ctx, Mode::Whole, era)
     {
         let span = span(e.start, e.end);
         return Some(Interpretation {
             kind: Kind::Date(r),
+            lang: language(&toks, &span),
             span,
             stage: Stage::Expression,
             as_epoch,
@@ -111,9 +123,10 @@ pub fn interpret(text: &str, ctx: &Ctx) -> Option<Interpretation> {
         return Some(Interpretation::epoch(e, Stage::Epoch));
     }
     for (mode, stage) in [(Mode::Strong, Stage::Text), (Mode::Weak, Stage::LooseText)] {
-        if let Some((r, span)) = scan(&toks, text, ctx, mode) {
+        if let Some((r, span)) = scan(&toks, text, ctx, mode, era) {
             return Some(Interpretation {
                 kind: Kind::Date(r),
+                lang: language(&toks, &span),
                 span,
                 stage,
                 as_epoch: None,
@@ -123,20 +136,56 @@ pub fn interpret(text: &str, ctx: &Ctx) -> Option<Interpretation> {
     epoch::in_blob(text).map(|e| Interpretation::epoch(e, Stage::EpochInText))
 }
 
-/// The earliest date expression in the text that is convincing for the mode.
-fn scan(toks: &[Token], src: &str, ctx: &Ctx, mode: Mode) -> Option<(Resolved, Range<usize>)> {
-    (0..toks.len()).find_map(|i| {
-        let e = expr::parse(toks, src, i, mode)?;
-        let convincing = match mode {
-            Mode::Strong => e.parsed.is_strong(),
-            _ => e.parsed.is_anchored(),
-        };
-        if !convincing || !standalone(toks, e.start, e.end) {
-            return None;
+/// The language the understood words are in. Each word votes for the
+/// languages it belongs to, a shared word splitting its vote (`oktober` is
+/// German and Dutch); ties go to the user's languages, then the listed order.
+fn language(toks: &[Token], span: &Range<usize>) -> Option<&'static str> {
+    let lexicon = lexicon();
+    let mut votes: Vec<(&'static str, f32)> = Vec::new();
+    for t in toks
+        .iter()
+        .filter(|t| t.start >= span.start && t.end <= span.end)
+    {
+        let mut langs: Vec<&'static str> = t.meanings.iter().map(|e| e.lang).collect();
+        langs.sort_unstable();
+        langs.dedup();
+        for &lang in &langs {
+            let share = 1.0 / langs.len() as f32;
+            match votes.iter_mut().find(|(l, _)| *l == lang) {
+                Some((_, v)) => *v += share,
+                None => votes.push((lang, share)),
+            }
         }
-        let r = expr::resolve(&e.parsed, ctx, mode)?;
-        Some((r, toks[e.start].start..toks[e.end - 1].end))
-    })
+    }
+    let (lang, _) = votes.into_iter().max_by(|a, b| {
+        let by_votes = a.1.total_cmp(&b.1);
+        by_votes.then(lexicon.rank(b.0).cmp(&lexicon.rank(a.0)))
+    })?;
+    Some(lang)
+}
+
+/// The earliest date expression in the text that is convincing for the mode.
+fn scan(
+    toks: &[Token],
+    src: &str,
+    ctx: &Ctx,
+    mode: Mode,
+    era: i16,
+) -> Option<(Resolved, Range<usize>)> {
+    (0..toks.len())
+        .filter(|&i| expr::could_start(toks, i))
+        .find_map(|i| {
+            let e = expr::parse(toks, src, i, mode)?;
+            let convincing = match mode {
+                Mode::Strong => e.parsed.is_strong(),
+                _ => e.parsed.is_anchored(),
+            };
+            if !convincing || !standalone(toks, e.start, e.end) {
+                return None;
+            }
+            let r = expr::resolve(&e.parsed, ctx, mode, era)?;
+            Some((r, toks[e.start].start..toks[e.end - 1].end))
+        })
 }
 
 /// Rejects matches that are part of a longer number-ish run: versions

@@ -1,0 +1,30 @@
+# Epochup settings. Copy to $XDG_CONFIG_HOME/epochup/config.toml and change what you like.
+#
+# Colors are "#rrggbb", or "#rrggbbaa" with transparency.
+
+[theme]
+# The window.
+background = "#191b22"
+# The input field.
+input = "#111111"
+# What you type.
+text = "#cccccc"
+# The clipboard, shown in the empty input.
+placeholder = "#6c757d"
+cursor = "#c4e3ff"
+# The input's border while picking among the values.
+input_border = "#202936"
+# The input's border while typing, and the picked value.
+accent = "#7d98ec"
+# The line under the input, the tags on values, outlines on hover.
+info = "#889ab1"
+# The main value.
+primary = "#ffffff"
+# The other values, the language label, the date found in what you typed.
+value = "#c4e3ff"
+# Behind the other values and the date found in the input.
+value_background = "#202936"
+# The picked value's text.
+selected_text = "#041520"
+# "no date or epoch found".
+error = "#e1746d"

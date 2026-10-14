@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod config;
 mod fonts;
 
 use std::cell::RefCell;
@@ -49,6 +50,7 @@ fn main() -> eframe::Result {
         rx
     });
 
+    let theme = config::load();
     let copied = Rc::new(RefCell::new(None));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -64,7 +66,9 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx, font.join().unwrap_or_default());
-            Ok(Box::new(app::App::new(cc, input, clip_rx, app_copied)))
+            Ok(Box::new(app::App::new(
+                cc, input, clip_rx, app_copied, theme,
+            )))
         }),
     )?;
 

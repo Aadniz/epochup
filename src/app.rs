@@ -14,21 +14,9 @@ use eframe::egui::{
 };
 use jiff::tz::TimeZone;
 
+use crate::config::Theme;
 use epochup::output::{self, Item, Outputs};
 use epochup::parse::{self, Ctx};
-
-// The palette of the sway, waybar and foot configs.
-const BG: Color32 = hex(0x191b22);
-const WELL: Color32 = hex(0x111111);
-const BORDER: Color32 = hex(0x202936);
-const TEXT: Color32 = hex(0xcccccc);
-const BRIGHT: Color32 = hex(0xffffff);
-const MUTED: Color32 = hex(0x6c757d);
-const INFO: Color32 = hex(0x889ab1);
-const ACCENT: Color32 = hex(0x7d98ec);
-const LIGHT: Color32 = hex(0xc4e3ff);
-const ON_ACCENT: Color32 = hex(0x041520);
-const ERROR: Color32 = hex(0xe1746d);
 
 const INPUT_SIZE: f32 = 18.0;
 const PRIMARY_SIZE: f32 = 19.0;
@@ -48,10 +36,6 @@ const ALT_KEYS: [Key; 9] = [
     Key::Num8,
     Key::Num9,
 ];
-
-const fn hex(rgb: u32) -> Color32 {
-    Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Source {
@@ -104,6 +88,7 @@ pub struct App {
     cursor: Option<Range<usize>>,
     /// The last thing copied, by Enter, a click or Ctrl+C; served once the window is gone.
     copied: Rc<RefCell<Option<String>>>,
+    theme: Theme,
 }
 
 impl App {
@@ -112,8 +97,9 @@ impl App {
         input: String,
         clip_rx: Option<Receiver<Option<String>>>,
         copied: Rc<RefCell<Option<String>>>,
+        theme: Theme,
     ) -> Self {
-        style(&cc.egui_ctx);
+        style(&cc.egui_ctx, &theme);
         App {
             input,
             clip: None,
@@ -128,6 +114,7 @@ impl App {
             rects: Vec::new(),
             cursor: None,
             copied,
+            theme,
         }
     }
 
@@ -299,14 +286,18 @@ impl App {
     fn input_field(&mut self, ui: &mut egui::Ui) {
         let (_, source) = self.source();
         let span = self.out.as_ref().and_then(|o| o.span.clone());
+        let theme = self.theme;
         let hint: egui::WidgetText = match (source, &self.clip, &span) {
-            (Source::Clipboard, Some(clip), Some(span)) => placeholder(clip, span.clone()).into(),
-            _ if self.clip.is_some() => hint_text("now").into(),
-            _ => hint_text("date or epoch").into(),
+            (Source::Clipboard, Some(clip), Some(span)) => {
+                placeholder(clip, span.clone(), &theme).into()
+            }
+            _ if self.clip.is_some() => hint_text("now", &theme).into(),
+            _ => hint_text("date or epoch", &theme).into(),
         };
         let typed_span = span.filter(|_| source == Source::Typed);
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-            let mut job = highlighted(buf.as_str(), typed_span.clone(), TEXT, LIGHT);
+            let colors = (theme.text, theme.value, theme.value_background);
+            let mut job = highlighted(buf.as_str(), typed_span.clone(), colors);
             job.wrap.max_width = wrap_width;
             ui.fonts_mut(|f| f.layout_job(job))
         };
@@ -327,8 +318,15 @@ impl App {
                     .lock_focus(true)
                     .frame(
                         egui::Frame::new()
-                            .fill(WELL)
-                            .stroke(Stroke::new(1.0, if typing { ACCENT } else { BORDER }))
+                            .fill(theme.input)
+                            .stroke(Stroke::new(
+                                1.0,
+                                if typing {
+                                    theme.accent
+                                } else {
+                                    theme.input_border
+                                },
+                            ))
                             .inner_margin(Margin::symmetric(8, 6)),
                     )
                     .layouter(&mut layouter)
@@ -357,11 +355,11 @@ impl App {
             ui.label(
                 RichText::new("no date or epoch found")
                     .size(INFO_SIZE)
-                    .color(ERROR),
+                    .color(self.theme.error),
             );
             return;
         };
-        info_row(ui, &out.info, out.language);
+        info_row(ui, &out.info, out.language, &self.theme);
         ui.add_space(8.0);
         // Laid out by hand: a wrapped egui row would give every row the primary's height.
         let values: Vec<_> = std::iter::once(&out.primary)
@@ -388,7 +386,7 @@ impl App {
                 (true, Focus::Input) => Mark::Default,
                 (true, Focus::Values) => Mark::Selected,
             };
-            value.paint(ui, &response, mark);
+            value.paint(ui, &response, mark, &self.theme);
             let hint = match k {
                 1..=9 => format!("{} · Alt+{k}", values[k].label),
                 _ => values[k].label.clone(),
@@ -426,7 +424,7 @@ impl eframe::App for App {
         self.refresh();
         // sway sizes floating windows itself, so everything fits a fixed size and scrolls past it.
         egui::Frame::new()
-            .fill(BG)
+            .fill(self.theme.background)
             .inner_margin(Margin::same(12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -446,19 +444,20 @@ impl eframe::App for App {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        BG.to_normalized_gamma_f32()
+        self.theme.background.to_normalized_gamma_f32()
     }
 }
 
-fn style(ctx: &egui::Context) {
+fn style(ctx: &egui::Context, theme: &Theme) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG;
-    visuals.window_fill = BG;
-    visuals.extreme_bg_color = WELL;
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0x7d, 0x98, 0xec, 0x60);
-    visuals.selection.stroke = Stroke::new(1.0, BRIGHT);
-    visuals.text_cursor.stroke = Stroke::new(2.0, LIGHT);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    visuals.panel_fill = theme.background;
+    visuals.window_fill = theme.background;
+    visuals.extreme_bg_color = theme.input;
+    let [r, g, b, _] = theme.accent.to_srgba_unmultiplied();
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(r, g, b, 0x60);
+    visuals.selection.stroke = Stroke::new(1.0, theme.primary);
+    visuals.text_cursor.stroke = Stroke::new(2.0, theme.cursor);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, theme.text);
     visuals.window_corner_radius = CornerRadius::ZERO;
     visuals.menu_corner_radius = CornerRadius::ZERO;
     ctx.set_theme(egui::Theme::Dark);
@@ -577,11 +576,11 @@ impl Value {
         vec2(tag + self.text.size().x, self.text.size().y) + 2.0 * pad(self.primary)
     }
 
-    fn paint(self, ui: &egui::Ui, response: &egui::Response, mark: Mark) {
+    fn paint(self, ui: &egui::Ui, response: &egui::Response, mark: Mark, theme: &Theme) {
         let (fg, bg, tag_color) = match (mark == Mark::Selected, self.primary) {
-            (true, _) => (ON_ACCENT, ACCENT, BORDER),
-            (false, true) => (BRIGHT, BG, INFO),
-            (false, false) => (LIGHT, BORDER, INFO),
+            (true, _) => (theme.selected_text, theme.accent, theme.value_background),
+            (false, true) => (theme.primary, theme.background, theme.info),
+            (false, false) => (theme.value, theme.value_background, theme.info),
         };
         let rect = response.rect;
         if !ui.is_rect_visible(rect) {
@@ -591,8 +590,8 @@ impl Value {
         painter.rect_filled(rect, CornerRadius::ZERO, bg);
         // The value Enter copies while typing gets the accent outline; hovering a dimmer one.
         let outline = match mark {
-            Mark::Default => Some(ACCENT),
-            Mark::None if response.hovered() => Some(INFO),
+            Mark::Default => Some(theme.accent),
+            Mark::None if response.hovered() => Some(theme.info),
             _ => None,
         };
         if let Some(color) = outline {
@@ -616,17 +615,17 @@ impl Value {
 
 /// The line under the input: what was understood on the left and, on the
 /// right, the language it was read in (日本語, Deutsch), unless English.
-fn info_row(ui: &mut egui::Ui, info: &str, language: Option<&str>) {
+fn info_row(ui: &mut egui::Ui, info: &str, language: Option<&str>, theme: &Theme) {
     let width = ui.available_width();
     let font = FontId::proportional(INFO_SIZE);
     let language = language.map(|name| {
         ui.painter()
-            .layout_no_wrap(name.to_owned(), font.clone(), LIGHT)
+            .layout_no_wrap(name.to_owned(), font.clone(), theme.value)
     });
     let room = language
         .as_ref()
         .map_or(width, |g| width - g.size().x - 12.0);
-    let mut job = LayoutJob::simple_singleline(info.to_owned(), font, INFO);
+    let mut job = LayoutJob::simple_singleline(info.to_owned(), font, theme.info);
     job.wrap = TextWrapping::truncate_at_width(room.max(0.0));
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let height = language
@@ -634,26 +633,28 @@ fn info_row(ui: &mut egui::Ui, info: &str, language: Option<&str>) {
         .map_or(galley.size().y, |g| g.size().y.max(galley.size().y));
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let elided = galley.elided;
-    ui.painter().galley(rect.left_top(), galley, INFO);
+    ui.painter().galley(rect.left_top(), galley, theme.info);
     if let Some(g) = language {
         let at = egui::pos2(rect.right() - g.size().x, rect.top());
-        ui.painter().galley(at, g, LIGHT);
+        ui.painter().galley(at, g, theme.value);
     }
     if elided {
         response.on_hover_text(info);
     }
 }
 
-fn hint_text(text: &str) -> RichText {
-    RichText::new(text).color(MUTED).size(INPUT_SIZE)
+fn hint_text(text: &str, theme: &Theme) -> RichText {
+    RichText::new(text)
+        .color(theme.placeholder)
+        .size(INPUT_SIZE)
 }
 
-/// `text` with `span` highlighted, unless the span is all of it.
+/// `text` with `span` highlighted, unless the span is all of it. The colors are
+/// the text's, the highlighted text's, and the highlight's background.
 fn highlighted(
     text: &str,
     span: Option<Range<usize>>,
-    color: Color32,
-    matched: Color32,
+    (color, matched, background): (Color32, Color32, Color32),
 ) -> LayoutJob {
     let plain = TextFormat {
         font_id: FontId::proportional(INPUT_SIZE),
@@ -675,7 +676,7 @@ fn highlighted(
                 &text[s.clone()],
                 0.0,
                 TextFormat {
-                    background: BORDER,
+                    background,
                     color: matched,
                     ..plain.clone()
                 },
@@ -688,7 +689,7 @@ fn highlighted(
 }
 
 /// The clipboard on one line, cut around the match: `…Date: Tue Oct 13 21:24:16 2026 +0200 fix the…`
-fn placeholder(clip: &str, span: Range<usize>) -> LayoutJob {
+fn placeholder(clip: &str, span: Range<usize>, theme: &Theme) -> LayoutJob {
     fn flat(s: &str) -> String {
         s.chars()
             .map(|c| if c.is_whitespace() { ' ' } else { c })
@@ -724,7 +725,8 @@ fn placeholder(clip: &str, span: Range<usize>) -> LayoutJob {
     if after.len() < after_all.len() {
         text.push('…');
     }
-    highlighted(&text, Some(start..end), MUTED, INFO)
+    let colors = (theme.placeholder, theme.info, theme.value_background);
+    highlighted(&text, Some(start..end), colors)
 }
 
 #[cfg(test)]

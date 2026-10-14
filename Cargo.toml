@@ -10,6 +10,7 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "wayl
 jiff = "0.2"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 libc = "0.2"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 
 [[bench]]
 name = "parse"

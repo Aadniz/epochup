@@ -45,3 +45,7 @@ bindsym $mod+u exec ~/.cargo/bin/epochup
 ```
 
 Chinese, Japanese, Korean and Thai text needs Noto Sans CJK and Noto Sans Thai installed.
+
+## Configure
+
+Colors can be changed in `~/.config/epochup/config.toml`. Copy [config.toml.example](config.toml.example), which lists every color with its default, and keep only what you change.
